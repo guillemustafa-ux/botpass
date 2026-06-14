@@ -1,0 +1,13 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.24"
+
+# RPC de cada red, leído de variables de entorno (.env). Se usa con --rpc-url sepolia
+[rpc_endpoints]
+sepolia = "${SEPOLIA_RPC_URL}"
+
+# API key de Etherscan para verificar el contrato (forge verify / --verify)
+[etherscan]
+sepolia = { key = "${ETHERSCAN_API_KEY}" }

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BotPass — Suscripción on-chain (dApp demo)</title>
+
+<!-- ethers.js v6 vía CDN: no hay build step, no node_modules. Abrís el HTML y anda.
+     integrity (SRI): si el CDN sirve un archivo alterado, el navegador lo rechaza. -->
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"
+        integrity="sha384-6Zl0Pc8zjSz8KvmNeXRvUQgY4ryFb+BwDvKCmLYcBME0joAaru491tQgi9B7zsMM"
+        crossorigin="anonymous"></script>
+
+<style>
+  :root {
+    --bg: #0b0e14; --card: #131826; --line: #1f2738;
+    --txt: #e6e9f0; --muted: #8b93a7; --accent: #5b8cff; --ok: #2ecc71; --bad: #e74c3c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--txt);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 460px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 16px; padding: 28px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.4);
+  }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .lock { font-size: 64px; text-align: center; margin: 8px 0 4px; transition: transform .2s; }
+  .lock.open { transform: scale(1.05); }
+  .status { text-align: center; font-weight: 600; margin-bottom: 18px; }
+  .status.on { color: var(--ok); } .status.off { color: var(--bad); }
+  .row { display: flex; justify-content: space-between; padding: 8px 0;
+         border-bottom: 1px solid var(--line); font-size: 14px; }
+  .row span:first-child { color: var(--muted); }
+  .row code { color: var(--txt); }
+  button {
+    width: 100%; margin-top: 16px; padding: 13px; border: 0; border-radius: 10px;
+    background: var(--accent); color: white; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: opacity .15s;
+  }
+  button:hover { opacity: .9; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--txt); }
+  .log { margin-top: 16px; font-size: 12px; color: var(--muted); min-height: 18px;
+         word-break: break-all; text-align: center; }
+  .log a { color: var(--accent); }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+           background: var(--line); color: var(--muted); }
+  .net { text-align: center; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>BotPass <span class="badge">testnet demo</span></h1>
+    <p class="sub">Suscripción on-chain. Pagás → recibís un pase NFT → el candado se abre.
+       Tu bot off-chain consulta <code>isActive(tokenId)</code> antes de mandar señales.</p>
+
+    <div class="net" id="net"></div>
+
+    <div class="lock" id="lock">🔒</div>
+    <div class="status off" id="status">Conectá tu wallet para empezar</div>
+
+    <div class="row"><span>Cuenta</span><code id="account">—</code></div>
+    <div class="row"><span>Precio</span><code id="price">—</code></div>
+    <div class="row"><span>Tu pase (tokenId)</span><code id="tokenId">—</code></div>
+    <div class="row"><span>Tiempo restante</span><code id="timeLeft">—</code></div>
+
+    <button type="button" id="connectBtn">Conectar wallet</button>
+    <button type="button" id="switchBtn" class="ghost" style="display:none">Cambiar a una red soportada</button>
+    <button type="button" id="subscribeBtn" style="display:none">Suscribirme / Renovar</button>
+
+    <div class="log" id="log"></div>
+  </div>
+
+<script>
+// ============================================================================
+// CONFIG — editá esto con la dirección de tu contrato desplegado en cada red.
+// Cada entrada: chainId (decimal) -> datos de la red.
+// El address es el del contrato BotPassNFT (src/BotPassNFT.sol) ya verificado.
+// ============================================================================
+const NETWORKS = {
+  11155111: {
+    name: "Sepolia",
+    explorer: "https://sepolia.etherscan.io",
+    contract: "0x39D0AE0B7eeEEf371D209453F0c81D75bCA02dEc",
+    hexId: "0xaa36a7",
+  },
+  84532: {
+    name: "Base Sepolia",
+    explorer: "https://sepolia.basescan.org",
+    contract: "0x39D0AE0B7eeEEf371D209453F0c81D75bCA02dEc",
+    hexId: "0x14a34",
+  },
+};
+
+// ABI mínima: solo lo que la dApp usa de BotPassNFT.
+const ABI = [
+  "function price() view returns (uint256)",
+  "function subscribe() payable returns (uint256)",
+  "function renew(uint256 tokenId) payable",
+  "function isActive(uint256 tokenId) view returns (bool)",
+  "function timeLeft(uint256 tokenId) view returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "event PassMinted(address indexed to, uint256 indexed tokenId, uint256 expiry)",
+];
+
+let provider, signer, contract, account, net, myTokenId = null;
+
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").innerHTML = msg; };
+
+// Formatea segundos como "Nd Nh Nm".
+function fmtDuration(secs) {
+  secs = Number(secs);
+  if (secs <= 0) return "vencido";
+  const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+  return [d && d + "d", h && h + "h", m && m + "m"].filter(Boolean).join(" ") || "<1m";
+}
+
+async function connect() {
+  if (!window.ethereum) { log("No se detectó wallet. Instalá MetaMask."); return; }
+  provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = await provider.getSigner();
+  account = await signer.getAddress();
+  await refreshNetwork();
+
+  // Reaccionar a cambios de cuenta/red sin recargar a mano.
+  window.ethereum.removeAllListeners?.();
+  window.ethereum.on("accountsChanged", () => location.reload());
+  window.ethereum.on("chainChanged", () => location.reload());
+}
+
+async function refreshNetwork() {
+  const { chainId } = await provider.getNetwork();
+  const id = Number(chainId);
+  net = NETWORKS[id];
+  $("account").textContent = account.slice(0, 6) + "…" + account.slice(-4);
+  $("connectBtn").style.display = "none";
+
+  if (!net) {
+    $("net").innerHTML = `Red no soportada (chainId ${id})`;
+    $("switchBtn").style.display = "block";
+    $("subscribeBtn").style.display = "none";
+    return;
+  }
+  if (net.contract === "0x0000000000000000000000000000000000000000") {
+    $("net").innerHTML = `Conectado a <b>${net.name}</b>`;
+    log("⚠️ Falta poner la dirección del contrato para esta red en NETWORKS (config arriba).");
+    return;
+  }
+
+  $("net").innerHTML = `Conectado a <b>${net.name}</b>`;
+  $("switchBtn").style.display = "none";
+  $("subscribeBtn").style.display = "block";
+  contract = new ethers.Contract(net.contract, ABI, signer);
+  await refreshState();
+}
+
+async function refreshState() {
+  try {
+    const price = await contract.price();
+    $("price").textContent = ethers.formatEther(price) + " ETH";
+
+    // BotPassNFT es ERC721 plano (sin Enumerable): recuperamos el tokenId del
+    // usuario leyendo el evento PassMinted filtrado por su address (indexed).
+    const filter = contract.filters.PassMinted(account);
+    const events = await contract.queryFilter(filter, 0, "latest");
+    if (events.length) {
+      // Tomamos el último pase minteado por esta cuenta.
+      myTokenId = events[events.length - 1].args.tokenId;
+      $("tokenId").textContent = "#" + myTokenId.toString();
+      const active = await contract.isActive(myTokenId);
+      const left = await contract.timeLeft(myTokenId);
+      $("timeLeft").textContent = fmtDuration(left);
+      setLock(active);
+      $("subscribeBtn").textContent = active ? "Renovar pase" : "Reactivar pase";
+    } else {
+      myTokenId = null;
+      $("tokenId").textContent = "—";
+      $("timeLeft").textContent = "—";
+      setLock(false);
+      $("subscribeBtn").textContent = "Suscribirme";
+    }
+  } catch (e) {
+    log("Error leyendo el contrato: " + (e.shortMessage || e.message));
+  }
+}
+
+function setLock(active) {
+  $("lock").textContent = active ? "🔓" : "🔒";
+  $("lock").classList.toggle("open", active);
+  $("status").textContent = active ? "Acceso ACTIVO" : "Sin acceso activo";
+  $("status").className = "status " + (active ? "on" : "off");
+}
+
+async function subscribe() {
+  try {
+    $("subscribeBtn").disabled = true;
+    const price = await contract.price();
+    // Si ya tiene un pase, renueva ese tokenId; si no, mintea uno nuevo.
+    const tx = myTokenId !== null
+      ? await contract.renew(myTokenId, { value: price })
+      : await contract.subscribe({ value: price });
+    log(`Tx enviada: <a href="${net.explorer}/tx/${tx.hash}" target="_blank">ver en explorer</a>`);
+    await tx.wait();
+    log("✅ Confirmado. Acceso actualizado.");
+    await refreshState();
+  } catch (e) {
+    log("❌ " + (e.shortMessage || e.message));
+  } finally {
+    $("subscribeBtn").disabled = false;
+  }
+}
+
+// Pide a la wallet cambiar a la primera red soportada (Sepolia).
+async function switchNetwork() {
+  const target = NETWORKS[11155111];
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: target.hexId }],
+    });
+  } catch (e) {
+    log("No se pudo cambiar de red: " + (e.message || e));
+  }
+}
+
+$("connectBtn").onclick = connect;
+$("subscribeBtn").onclick = subscribe;
+$("switchBtn").onclick = switchNetwork;
+
+// Si la wallet ya estaba autorizada, reconectar solo.
+if (window.ethereum?.selectedAddress) connect();
+</script>
+</body>
+</html>
